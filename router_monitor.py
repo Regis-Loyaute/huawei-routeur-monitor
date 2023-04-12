@@ -71,6 +71,14 @@ def delayed_send_discord_message(webhook_url, content, delay):
 
     threading.Thread(target=send_after_delay).start()
 
+def login_modem(connection):
+    client = Client(connection)
+    try:
+        client.user.login(args.username, args.password)
+        return client
+    except Exception as e:
+        logging.error(f"Login error: {e}")
+        return None
 
 # Load environment variables
 modem_url = os.getenv('MODEM_URL')
@@ -112,35 +120,57 @@ backoff = 1
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-with Connection(args.url, username=args.username, password=args.password) as connection:
+from huawei_lte_api.exceptions import ResponseErrorLoginRequiredException
+
+def login_modem(connection):
     client = Client(connection)
+    try:
+        client.user.login(args.username, args.password)
+        return client
+    except Exception as e:
+        logging.error(f"Login error: {e}")
+        return None
+
+with Connection(args.url) as connection:
+    client = login_modem(connection)
+    if client is None:
+        exit(1)
 
     while True:
         if not ping(args.target_ip):
-            print(f"Ping to {args.target_ip} failed.")
+            logging.warning(f"Ping to {args.target_ip} failed.")
             current_time = time.time()
 
             # Remove reboot timestamps older than reboot_interval
             reboot_times = [t for t in reboot_times if (current_time - t) <= args.reboot_interval]
 
             if len(reboot_times) < args.max_reboots:
-                print("Rebooting modem...")
-                reboot_modem(client)
-                reboot_times.append(current_time)
-                # Send a delayed message to the Discord webhook
-                webhook_url = os.environ.get('DISCORD_WEBHOOK_URL')
-                if webhook_url:
-                    delay_seconds = 5 * 60  # 5 minutes in seconds
-                    delayed_send_discord_message(webhook_url, f"Modem at {args.url} rebooted due to ping failure to {args.target_ip}", delay_seconds)
-                # Wait for the modem/router to restart properly
-                time.sleep(60 * backoff)
-                # Implement exponential backoff with a maximum of 15 minutes
-                backoff = min(backoff * 2, 15)
+                try:
+                    reboot_modem(client)
+                    reboot_times.append(current_time)
+                    # Send a delayed message to the Discord webhook
+                    webhook_url = os.environ.get('DISCORD_WEBHOOK_URL')
+                    if webhook_url:
+                        delay_seconds = 5 * 60  # 5 minutes in seconds
+                        delayed_send_discord_message(webhook_url, f"Modem at {args.url} rebooted due to ping failure to {args.target_ip}", delay_seconds)
+                    # Wait for the modem/router to restart properly
+                    time.sleep(60 * backoff)
+                    # Implement exponential backoff with a maximum of 15 minutes
+                    backoff = min(backoff * 2, 15)
+                except ResponseErrorLoginRequiredException:
+                    logging.warning("Re-authenticating with the modem")
+                    client = login_modem(connection)
+                    if client is None:
+                        exit(1)
+                    reboot_modem(client)
+                except Exception as e:
+                    logging.error(f"Error during reboot: {e}")
             else:
-                print("Maximum number of reboots reached. Skipping reboot.")
+                logging.warning("Maximum number of reboots reached. Skipping reboot.")
         else:
-            print(f"Ping to {args.target_ip} successful.")
+            logging.info(f"Ping to {args.target_ip} successful.")
             # Reset the backoff timer if the ping is successful
             backoff = 1
 
         time.sleep(args.interval)
+
