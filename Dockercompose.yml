@@ -1,0 +1,15 @@
+version: '3'
+services:
+  router-monitor:
+    image: reeeeegis/huawei-routeur-monitor:latest
+    container_name: huawei-routeur-monitor
+    restart: always
+    environment:
+      MODEM_URL: http://192.168.1.1
+      MODEM_USERNAME: admin
+      MODEM_PASSWORD: 
+      TARGET_IPS: 10.0.0.1,1.1.1.1
+      PING_INTERVAL: 60
+      MAX_REBOOTS: 3
+      REBOOT_INTERVAL: 3600
+      DISCORD_WEBHOOK_URL: https://discord.com/api/webhooks/
