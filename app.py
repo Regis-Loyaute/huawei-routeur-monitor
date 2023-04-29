@@ -6,6 +6,8 @@ import requests
 import threading
 import subprocess
 import logging
+import time
+from collections import deque
 from argparse import ArgumentParser
 from huawei_lte_api.Connection import Connection
 from huawei_lte_api.Client import Client
@@ -71,14 +73,6 @@ def delayed_send_discord_message(webhook_url, content, delay):
 
     threading.Thread(target=send_after_delay).start()
 
-def login_modem(connection):
-    client = Client(connection)
-    try:
-        client.user.login(args.username, args.password)
-        return client
-    except Exception as e:
-        logging.error(f"Login error: {e}")
-        return None
 
 # Load environment variables
 modem_url = os.getenv('MODEM_URL')
@@ -122,6 +116,12 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 from huawei_lte_api.exceptions import ResponseErrorLoginRequiredException
 
+import time
+from collections import deque
+from huawei_lte_api.Client import Client
+from huawei_lte_api.Connection import Connection
+from huawei_lte_api.exceptions import ResponseErrorLoginRequiredException
+
 def login_modem(connection):
     client = Client(connection)
     try:
@@ -131,21 +131,50 @@ def login_modem(connection):
         logging.error(f"Login error: {e}")
         return None
 
-with Connection(args.url) as connection:
-    client = login_modem(connection)
-    if client is None:
-        exit(1)
+def is_modem_responding(client, connection, max_retries=3, retry_interval=5):
+    for _ in range(max_retries):
+        try:
+            device_info = client.device.information()
+            if device_info:
+                return True
+            else:
+                return False
+        except ResponseErrorLoginRequiredException:
+            logging.warning("Re-authenticating with the modem")
+            client = login_modem(connection)
+            if client is None:
+                exit(1)
+            return is_modem_responding(client, connection)
+        except Exception as e:
+            logging.error(f"Error checking modem response: {e}")
+            time.sleep(retry_interval)
+    return False
 
-    while True:
-        if not ping(args.target_ip):
-            logging.warning(f"Ping to {args.target_ip} failed.")
-            current_time = time.time()
+def establish_connection(url, max_retries=3, retry_interval=5):
+    for _ in range(max_retries):
+        try:
+            return Connection(url)
+        except Exception as e:
+            logging.error(f"Error establishing connection: {e}")
+            time.sleep(retry_interval)
+    return None
 
-            # Remove reboot timestamps older than reboot_interval
-            reboot_times = [t for t in reboot_times if (current_time - t) <= args.reboot_interval]
+reboot_times = deque(maxlen=args.max_reboots)
 
-            if len(reboot_times) < args.max_reboots:
-                try:
+# Establish the initial connection
+connection = establish_connection(args.url)
+if connection is None:
+    exit(1)
+client = login_modem(connection)
+
+while True:
+    if not ping(args.target_ip):
+        logging.warning(f"Ping to {args.target_ip} failed.")
+        current_time = time.time()
+
+        if len(reboot_times) < args.max_reboots or (current_time - reboot_times[0]) > args.reboot_interval:
+            try:
+                if is_modem_responding(client, connection):
                     reboot_modem(client)
                     reboot_times.append(current_time)
                     # Send a delayed message to the Discord webhook
@@ -157,20 +186,18 @@ with Connection(args.url) as connection:
                     time.sleep(60 * backoff)
                     # Implement exponential backoff with a maximum of 15 minutes
                     backoff = min(backoff * 2, 15)
-                except ResponseErrorLoginRequiredException:
-                    logging.warning("Re-authenticating with the modem")
-                    client = login_modem(connection)
-                    if client is None:
-                        exit(1)
-                    reboot_modem(client)
-                except Exception as e:
-                    logging.error(f"Error during reboot: {e}")
-            else:
-                logging.warning("Maximum number of reboots reached. Skipping reboot.")
+            except ResponseErrorLoginRequiredException:
+                logging.warning("Re-authenticating with the modem")
+                client = login_modem(connection)
+                if client is None:
+                    exit(1)
+                reboot_modem(client)
+            except Exception as e:
+                logging.error(f"Error during reboot: {e}")
         else:
-            logging.info(f"Ping to {args.target_ip} successful.")
-            # Reset the backoff timer if the ping is successful
-            backoff = 1
+            logging.warning("Maximum number of reboots reached. Skipping reboot.")
+    else:
+        logging.info(f"Ping to {args.target_ip} successful.")
+        backoff = 1
 
-        time.sleep(args.interval)
-
+    time.sleep(args.interval)
