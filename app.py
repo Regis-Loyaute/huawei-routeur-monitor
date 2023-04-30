@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+
 # Initialize logging
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
@@ -69,17 +71,25 @@ def delayed_send_discord_message(webhook_url, content, delay):
 
     threading.Thread(target=send_after_delay).start()
 
+def login_modem(connection):
+    client = Client(connection)
+    try:
+        client.user.login(args.username, args.password)
+        return client
+    except Exception as e:
+        logging.error(f"Login error: {e}")
+        return None
+
 # Load environment variables
 modem_url = os.getenv('MODEM_URL')
 modem_username = os.getenv('MODEM_USERNAME')
 modem_password = os.getenv('MODEM_PASSWORD')
-target_ips = os.getenv('TARGET_IPS', '').split(',')
+target_ip = os.getenv('TARGET_IP')
 ping_interval = int(os.getenv('PING_INTERVAL'))
 max_reboots = int(os.getenv('MAX_REBOOTS'))
 reboot_interval = int(os.getenv('REBOOT_INTERVAL'))
-ping_attempts = int(os.getenv('PING_ATTEMPTS', 3))
-reboot_wait = int(os.getenv('REBOOT_WAIT', 120))
 discord_webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+
 
 # Parse command line arguments
 parser = ArgumentParser()
@@ -89,12 +99,10 @@ parser.add_argument('--username', type=str, default=modem_username,
                     help='The username for the modem\'s web interface. Can also be set with the MODEM_USERNAME environment variable.')
 parser.add_argument('--password', type=str, default=modem_password,
                     help='The password for the modem\'s web interface. Can also be set with the MODEM_PASSWORD environment variable.')
-parser.add_argument('--target_ips', type=lambda s: [ip.strip() for ip in s.split(',')], default=target_ips, help='Comma-separated list of target IP addresses to ping')
-parser.add_argument('--interval', type=int, default=ping_interval, help='The initial interval between pings in seconds')
+parser.add_argument('--target_ip', type=str, default=target_ip, help='The target IP address to ping')
+parser.add_argument('--interval', type=int, default=ping_interval, help='The interval between pings in seconds')
 parser.add_argument('--max_reboots', type=int, default=max_reboots, help='The maximum number of reboots within the reboot_interval')
 parser.add_argument('--reboot_interval', type=int, default=reboot_interval, help='The time frame (in seconds) for limiting the number of reboots')
-parser.add_argument('--ping_attempts', type=int, default=ping_attempts, help='The number of consecutive failed pings required before initiating a reboot')
-parser.add_argument('--reboot_wait', type=int, default=reboot_wait, help='The waiting time after a reboot in seconds')
 
 args = parser.parse_args()
 
@@ -105,11 +113,13 @@ if args.url is None:
 reboots = 0
 reboot_times = []
 backoff = 1
-successful_pings = 0
+consecutive_failures = 0
 
 # Register signal handler
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+from huawei_lte_api.exceptions import ResponseErrorLoginRequiredException
 
 def login_modem(connection):
     client = Client(connection)
@@ -126,17 +136,10 @@ with Connection(args.url) as connection:
         exit(1)
 
     while True:
-        failed_pings = 0
-        for target_ip in args.target_ips:
-            if not ping(target_ip):
-                logging.warning(f"Ping to {target_ip} failed.")
-                failed_pings += 1
-            else:
-                logging.info(f"Ping to {target_ip} successful.")
-
-        if failed_pings == len(args.target_ips):
-            successful_pings = 0
-            if failed_pings >= args.ping_attempts:
+        if not ping(args.target_ip):
+            consecutive_failures += 1
+            logging.warning(f"Ping to {args.target_ip} failed.")
+            if consecutive_failures >= 2:
                 current_time = time.time()
 
                 # Remove reboot timestamps older than reboot_interval
@@ -147,22 +150,28 @@ with Connection(args.url) as connection:
                         reboot_modem(client)
                         reboot_times.append(current_time)
                         # Send a delayed message to the Discord webhook
-                        if discord_webhook_url:
+                        webhook_url = os.environ.get('DISCORD_WEBHOOK_URL')
+                        if webhook_url:
                             delay_seconds = 5 * 60  # 5 minutes in seconds
-                            delayed_send_discord_message(discord_webhook_url, f"Modem at {args.url} rebooted due to ping failure to {','.join(args.target_ips)}", delay_seconds)
+                            delayed_send_discord_message(webhook_url, f"Modem at {args.url} rebooted due to 2 consecutive ping failures to {args.target_ip}", delay_seconds)
                         # Wait for the modem/router to restart properly
-                        time.sleep(args.reboot_wait * backoff)
+                        time.sleep(60 * backoff)
                         # Implement exponential backoff with a maximum of 15 minutes
                         backoff = min(backoff * 2, 15)
+                    except ResponseErrorLoginRequiredException:
+                        logging.warning("Re-authenticating with the modem")
+                        client = login_modem(connection)
+                        if client is None:
+                            exit(1)
+                        reboot_modem(client)
                     except Exception as e:
                         logging.error(f"Error during reboot: {e}")
                 else:
                     logging.warning("Maximum number of reboots reached. Skipping reboot.")
         else:
-            successful_pings += 1
-            if successful_pings >= args.ping_attempts:
-                backoff = 1
-                args.interval = min(args.interval * 2, 60)  # Double the interval, but cap at 60 seconds
-            else:
-                args.interval = max(args.interval // 2, 1)  # Halve the interval, but don't go below 1
+            logging.info(f"Ping to {args.target_ip} successful.")
+            # Reset the backoff timer and consecutive_failures counter if the ping is successful
+            backoff = 1
+            consecutive_failures = 0
+
         time.sleep(args.interval)
